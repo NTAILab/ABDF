@@ -8,7 +8,6 @@ from bosk.executor.sklearn_interface import BoskPipelineClassifier
 from sklearn.ensemble._forest import ForestClassifier
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from typing import Type
-from collections import defaultdict
 import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
@@ -20,19 +19,55 @@ from sklearn.datasets import make_moons
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 import numba
-from numba.types import bool_
-import sys
+from time import time
 
 @numba.njit
-def find_close_elems(x_1, x_2):
-    eps = 10 ** -6
-    res = np.zeros(x_1.shape[0], bool_)
-    for i in range(x_1.shape[0]):
-        for j in range(x_2.shape[0]):
-            if np.sum(np.abs(x_1[i] - x_2[j])) < eps:
-                res[i] = True
-                break
-    return res
+def index_getter(x_tensor, y_tensor, forest_idx):
+    x_estim = np.zeros((x_tensor.shape[0], forest_idx.shape[0], x_tensor.shape[-1]), dtype=np.float64)
+    probas = np.zeros((x_tensor.shape[0], forest_idx.shape[0], y_tensor.shape[-1]), dtype=np.float64)
+    for id_point in range(forest_idx.shape[0]):
+        for id_fold in range(x_tensor.shape[0]):
+            trees_used = 0
+            for id_tree in range(forest_idx.shape[1]):
+                x_estim[id_fold, id_point, :] += x_tensor[id_fold, id_tree, forest_idx[id_point, id_tree]].copy()
+                probas[id_fold, id_point, :] += y_tensor[id_fold, id_tree, forest_idx[id_point, id_tree]].copy()
+                if np.any(y_tensor[id_fold, id_tree, forest_idx[id_point, id_tree]] > 0):
+                    trees_used += 1
+            if trees_used > 0:
+                x_estim[id_fold, id_point] /= trees_used
+                probas[id_fold, id_point] /= trees_used
+    return x_estim, probas
+
+@numba.njit
+def build_tensors(X, y, fold_idxes, apply_res, max_nodes, c_num):
+    folds_num = len(fold_idxes)
+    trees_num = apply_res.shape[1]
+    forest_x_tensor = np.zeros((folds_num, trees_num, max_nodes, X.shape[1]), dtype=np.float32)
+    forest_y_tensor = np.zeros((folds_num, trees_num, max_nodes, c_num), dtype=np.float32)
+    counter = np.empty((trees_num, max_nodes), dtype=np.int32)
+    one_hot = np.eye(c_num)
+    for id_fold in range(folds_num):
+        cur_fold_idx = fold_idxes[id_fold]
+        x_fold = X[cur_fold_idx]
+        y_fold = y[cur_fold_idx]
+        cur_apply = apply_res[cur_fold_idx]
+        counter.fill(0)
+        for id_point in range(cur_apply.shape[0]):
+            idx_leafs = cur_apply[id_point]
+            cur_x = x_fold[id_point]
+            cur_y = one_hot[y_fold[id_point]]
+            for id_tree in range(trees_num):
+                id_leaf = idx_leafs[id_tree]
+                forest_x_tensor[id_fold, id_tree, id_leaf] += cur_x
+                forest_y_tensor[id_fold, id_tree, id_leaf] += cur_y
+                counter[id_tree, id_leaf] += 1
+        for id_tree in range(trees_num):
+            for id_leaf in range(max_nodes):
+                if counter[id_tree, id_leaf] > 0:
+                    forest_x_tensor[id_fold, id_tree, id_leaf] /= counter[id_tree, id_leaf]
+                    forest_y_tensor[id_fold, id_tree, id_leaf] /= counter[id_tree, id_leaf]
+    return forest_x_tensor, forest_y_tensor
+        
 
 # forest which gives not only the y estim
 # but the x according to the leaf close elements
@@ -44,7 +79,7 @@ class EstimForest(BaseBlock):
         self.forest = forest_cls(n_jobs=-1, **forest_kw)
         if name is not None:
             self.name = name
-        fold_inputs = [InputSlotMeta(f'X_fold_{i}', Stages(True, False)) for i in range(folds_num)]
+        fold_inputs = [InputSlotMeta(f'fold_idx_{i}', Stages(True, False)) for i in range(folds_num)]
         self.meta = BlockMeta(
             inputs=[
                 InputSlotMeta('X', Stages()),
@@ -57,79 +92,31 @@ class EstimForest(BaseBlock):
             ]
         )
         self.folds_num = folds_num
+        self.x_tensor = None
+        self.y_tensor = None
         super().__init__()
 
     def fit(self: BlockT, inputs: BlockInputData) -> BlockT:
         x_np = inputs['X'].data
         y_np = inputs['y'].data
-        self.c_num = np.max(y_np).astype(np.int0) + 1
-        x_fold_list = [inputs[f'X_fold_{i}'].data.copy() for i in range(self.folds_num)]
+        c_num = y_np.max().astype(np.int0) + 1
+        idx_folds = tuple(inputs[f'fold_idx_{i}'].data.copy() for i in range(self.folds_num))
         self.forest.fit(x_np, y_np)
-        idxes = self.forest.apply(x_np)
-        # tree -> leaf -> x list
-        idx_to_x = [defaultdict(list) for _ in range(self.forest.n_estimators)]
-        idx_to_y = [defaultdict(list) for _ in range(self.forest.n_estimators)]
-        one_hot = np.eye(self.c_num)
-        for i in range(len(idxes)):
-            for j, l_i in enumerate(idxes[i]):
-                idx_to_x[j][l_i].append(x_np[i])
-                idx_to_y[j][l_i].append(one_hot[y_np[i]])
-        # tree -> leaf -> x array FILTERED FOR EACH FOLD
-        # x array is list lenght of folds with MEANS
-        x_map = []
-        y_map = []
-        for i in range(self.forest.n_estimators):
-            cur_dict_x = dict()
-            cur_dict_y = dict()
-            x_map.append(cur_dict_x)
-            y_map.append(cur_dict_y)
-            for leaf_idx in idx_to_x[i]:
-                x_arr = np.array(idx_to_x[i][leaf_idx])
-                y_arr = np.array(idx_to_y[i][leaf_idx])
-                total_x_list = []
-                total_y_list = []
-                for j in range(self.folds_num):
-                    # filter_mask = np.max(np.sum(
-                    #         np.abs(x_arr[None, ...] - x_fold_list[j][:, None, :]), axis=-1
-                    #     ) < eps, axis=0)
-                    filter_mask = find_close_elems(x_arr, x_fold_list[j])
-                    if np.max(filter_mask) == False:
-                        total_x_list.append(None)
-                        total_y_list.append(None)
-                        continue
-                    total_x_list.append(np.mean(x_arr[filter_mask], axis=0))
-                    total_y_list.append(np.mean(y_arr[filter_mask], axis=0))
-                cur_dict_x[leaf_idx] = total_x_list
-                cur_dict_y[leaf_idx] = total_y_list
-        self.x_map = x_map
-        self.y_map = y_map
+        max_nodes = 0
+        for tree in self.forest.estimators_:
+            max_nodes = max(max_nodes, tree.tree_.node_count)
+        apply_res = self.forest.apply(x_np)
+        self.x_tensor, self.y_tensor = build_tensors(x_np, y_np, idx_folds, apply_res, max_nodes, c_num)
         return self
 
     def transform(self, inputs: BlockInputData) -> TransformOutputData:
         x_np = inputs['X'].data
         leaf_idx = self.forest.apply(x_np)
+        x_output, probas_output = index_getter(self.x_tensor, self.y_tensor, leaf_idx)
         output_dict = dict()
-        for f_i in range(self.folds_num):
-            x_estim = np.zeros_like(x_np)
-            probas = np.zeros((x_np.shape[0], self.c_num))
-            for i in range(len(x_np)):
-                trees_used = 0
-                for j in range(self.forest.n_estimators):
-                    x_filtered = self.x_map[j][leaf_idx[i, j]][f_i]
-                    if x_filtered is None:
-                        continue
-                    y_filtered = self.y_map[j][leaf_idx[i, j]][f_i]
-                    x_estim[i] += x_filtered
-                    probas[i] += y_filtered
-                    trees_used += 1
-                if trees_used == 0:
-                    postfix = '' if self.name is None else f' in {self.name}'
-                    print('None of the trees were used during prediction' + postfix, file=sys.stderr)
-                else:
-                    x_estim[i] /= trees_used
-                    probas[i] /= trees_used
-            output_dict[f'probas_{f_i}'] = CPUData(probas)
-            output_dict[f'x_estim_{f_i}'] = CPUData(x_estim)
+        for i_fold in range(self.folds_num):
+            output_dict[f'x_estim_{i_fold}'] = CPUData(x_output[i_fold].astype(np.float64))
+            output_dict[f'probas_{i_fold}'] = CPUData(probas_output[i_fold].astype(np.float64))
         return output_dict
 
 
@@ -140,7 +127,7 @@ class AttentionHead(torch.nn.Module):
         self.device = torch.device('cpu')
         self.gamma = torch.ones(1, requires_grad=True, device=self.device)
         self.optimizer = torch.optim.AdamW([self.gamma], lr=2e-1)
-        self.epochs_num = 300
+        self.epochs_num = 100
         self.batch_size = 128
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction='sum')
         self.name = name
@@ -221,7 +208,6 @@ def get_adf_class_pipeline(layers_num: int, forests_num: int, heads_num: int, tr
     FOREST_WRAPPER = lambda name, cls, **kw: b.new(EstimForest, folds_num=heads_num, name=name, forest_cls=cls, n_estimators=trees)(**kw)
     forest_cls_list = [RandomForestClassifier if i % 2 == 0 else ExtraTreesClassifier for i in range(forests_num)]
     ATTENTION_WRAPPER = lambda name, **kw: b.new(AttentionHead, name)(**kw)
-    SLICE_WRAPPER = lambda **kw: b.new(SliceBlock)(**kw)
     SCALER_WRAPPER = lambda **kw: b.new(StdScalerBlock)(**kw)
     x_input = b.Input()()
     y_input = b.TargetInput()()
@@ -233,9 +219,9 @@ def get_adf_class_pipeline(layers_num: int, forests_num: int, heads_num: int, tr
             x = scaler
         fold_gen = b.CVTrainIndices(size=heads_num, random_state=None)(
             X=x, y=y_input)
-        inp_fold_names = [f'X_fold_{i}' for i in range(heads_num)]
-        folds_x = [SLICE_WRAPPER(X=x, idx=fold_gen[str(i)]) for i in range(heads_num)]
-        forest_folds_map = dict(zip(inp_fold_names, folds_x))
+        inp_fold_names = [f'fold_idx_{i}' for i in range(heads_num)]
+        inp_fold_idxes = [fold_gen[str(i)] for i in range(heads_num)]
+        forest_folds_map = dict(zip(inp_fold_names, inp_fold_idxes))
         forest_list = [FOREST_WRAPPER(f'AF_{j}', forest_cls_list[j], X=x, y=y_input, **forest_folds_map) for j in range(forests_num)]
         slots_names = [f'forest_{i}' for i in range(forests_num)]
         X_hat_list = []
@@ -267,16 +253,23 @@ def get_adf_class_pipeline(layers_num: int, forests_num: int, heads_num: int, tr
         inputs={'X': x_input, 'y': y_input},
         outputs={'probas': probas, 'labels': labels}
     )
+    # pipeline.set_random_state(123)
     # TopologicalPainter(figure_dpi=150, graph_levels_sep=3).from_pipeline(pipeline).render('pipeline.png')
     return BoskPipelineClassifier(pipeline, outputs_map={'pred': 'labels', 'proba': 'probas'})
     
 
 def adf_test():
-    pipeline = get_adf_class_pipeline(2, 2, 3, 100)
-    X, y = make_moons(200, noise=0.1)
+    pipeline = get_adf_class_pipeline(2, 2, 10, 100)
+    X, y = make_moons(5000, noise=0.1, random_state=123)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5)
+    time_stamp = time()
     pipeline.fit(X_train, y_train)
+    fit_time = time() - time_stamp
+    print('fit time:', fit_time)
+    time_stamp = time()
     result = pipeline.predict(X_test)
+    pred_time = time() - time_stamp
+    print('pred time:', pred_time)
     print('acc:', accuracy_score(y_test, result))
     print('roc-auc:', roc_auc_score(y_test, result))
 
